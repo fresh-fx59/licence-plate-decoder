@@ -1,48 +1,62 @@
 package com.example.licenceplatedecoder.service.impl;
 
+import com.example.licenceplatedecoder.model.MayBeVehicle;
+import com.example.licenceplatedecoder.service.VehicleDetectionService;
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+import reactor.core.publisher.Mono;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 @Service
-public class VehicleDetectionGeminiServiceImpl {
+public class VehicleDetectionGeminiServiceImpl implements VehicleDetectionService {
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final HttpClient httpClient = HttpClient.newHttpClient();
     private final String GOOGLE_API_URL = "https://us-central1-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/us-central1/endpoints/YOUR_ENDPOINT_ID:predict";
 
     public Mono<MayBeVehicle> findVehicle(MultipartFile file) {
-        Callable<MayBeVehicle> task = () -> {
-            Path tempFile = Files.createTempFile(UUID.randomUUID().toString(), file.getOriginalFilename());
+        Supplier<MayBeVehicle> task = () -> {
+            HttpRequest request = null;
             try {
-                Files.write(tempFile, file.getBytes());
-
-                HttpRequest request = HttpRequest.newBuilder()
+                request = HttpRequest.newBuilder()
                         .uri(URI.create(GOOGLE_API_URL))
                         .header("Authorization", "Bearer " + getAccessToken())
                         .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(buildRequestBody(tempFile)))
+                        .POST(HttpRequest.BodyPublishers.ofString(buildRequestBody(file.getBytes())))
                         .build();
-
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                return parseResponse(response.body());
-            } finally {
-                Files.deleteIfExists(tempFile);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
+
+            CompletableFuture<HttpResponse<String>> response = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+                return parseResponse(response);
         };
 
-        Future<MayBeVehicle> future = executor.submit(task);
+        CompletableFuture<MayBeVehicle> future = CompletableFuture.supplyAsync(task);
 
-        return Mono.fromFuture(() -> {
-            try {
-                return future.get(10, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                throw new RuntimeException("Google AI processing timeout", e);
-            } catch (InterruptedException | ExecutionException | IOException e) {
-                throw new RuntimeException("Error during Google AI processing", e);
-            }
-        });
+        return Mono.fromFuture((Supplier<CompletableFuture<MayBeVehicle>>) () -> future)
+                .timeout(java.time.Duration.ofSeconds(10)) // Apply timeout directly to the Mono
+                .onErrorResume(TimeoutException.class, e -> Mono.error(new RuntimeException("Google AI processing timeout", e)))
+                .onErrorResume(InterruptedException.class, e -> Mono.error(new RuntimeException("Google AI processing interrupted", e)))
+                .onErrorResume(ExecutionException.class, e -> Mono.error(new RuntimeException("Error during Google AI processing", e)))
+                .flatMap(result -> result == null ? Mono.empty() : Mono.just(result));
     }
 
-    private String buildRequestBody(Path imagePath) throws IOException {
-        String base64Image = java.util.Base64.getEncoder().encodeToString(Files.readAllBytes(imagePath));
+    private String buildRequestBody(byte[] imageBytes) throws IOException {
+        String base64Image = java.util.Base64.getEncoder().encodeToString(imageBytes);
         return "{" +
                 "\"instances\":[{" +
                 "\"content\":\"" + base64Image + "\"" +
@@ -56,10 +70,16 @@ public class VehicleDetectionGeminiServiceImpl {
         return credentials.getAccessToken().getTokenValue();
     }
 
-    private MayBeVehicle parseResponse(String responseBody) {
-        JsonObject jsonObject = JsonParser.parseString(responseBody).getAsJsonObject();
+    private MayBeVehicle parseResponse(CompletableFuture<HttpResponse<String>> responseBody) {
+        JsonObject jsonObject;
+        try {
+            jsonObject = JsonParser.parseString(responseBody.get().body()).getAsJsonObject();
+        } catch (InterruptedException | ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+
         JsonArray predictions = jsonObject.getAsJsonArray("predictions");
-        if (predictions.size() == 0) return new MayBeVehicle(false, "", false);
+        if (predictions.isEmpty()) return new MayBeVehicle(false, "", false);
 
         JsonObject prediction = predictions.get(0).getAsJsonObject();
         boolean isVehicle = prediction.has("vehicle") && prediction.get("vehicle").getAsBoolean();
