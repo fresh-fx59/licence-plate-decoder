@@ -34,7 +34,7 @@ import static java.util.logging.Level.SEVERE;
 public class TestServiceImpl implements TestService {
     private static final Logger log = Logger.getLogger(TestServiceImpl.class.getName());
 
-    @Value("google.api.key")
+    @Value("${google.api.key}")
     private String GOOGLE_API_KEY;
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
